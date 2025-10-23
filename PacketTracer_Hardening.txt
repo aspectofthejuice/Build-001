@@ -1,0 +1,33 @@
+! PacketTracer_Hardening.txt
+! Cisco Router/Switch Hardening Templates (CyberPatriot)
+
+! Router baseline
+enable secret StrongP@ss123
+service password-encryption
+no ip http server
+no ip http secure-server
+hostname R1
+line vty 0 4
+ transport input ssh
+ login local
+ exec-timeout 10 0
+username admin privilege 15 secret AdminP@ssw0rd!
+ip domain-name cyber.local
+crypto key generate rsa modulus 2048
+ip ssh version 2
+no cdp run
+service timestamps log datetime msec
+end
+write memory
+
+! Switch baseline
+hostname SW1
+no ip domain-lookup
+line vty 0 4
+ transport input ssh
+ login local
+username netadmin privilege 15 secret S3cureP@ss!
+interface range fa0/10 - 24
+ shutdown
+end
+write memory
