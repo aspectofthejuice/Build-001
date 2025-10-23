@@ -1,150 +1,137 @@
 <#
 .SYNOPSIS
-  Harden-WindowsHost.ps1 (CyberPatriot Edition)
+  CyberPatriot_Windows11_Checklist.ps1
 .DESCRIPTION
-  Defensive hardening script for Windows 10/11 and Server 2022 environments.
-  Aligns with CyberPatriot, CIS Benchmarks, and DoD STIG principles.
-  Applies secure configurations, logs all actions, and supports dry-run auditing.
-  Must be run as Administrator.
-.NOTES
-  - Author: John CyberPatriot (AI Assistant)
-  - Ethical use only. No offensive operations.
-  - Safe to re-run (idempotent).
-  - Logs and summaries stored in %ProgramData%\WindowsHardeningLogs
-.PARAMETER DryRun
-  Run in audit-only mode (reports changes without applying).
-.EXAMPLE
-  .\Harden-WindowsHost.ps1 -DryRun
-  .\Harden-WindowsHost.ps1
+  Automated implementation of the CyberPatriot hardening checklist for Windows 11 workstations.
+  Must be run as Administrator. Logs actions to %ProgramData%\CyberPatriotLogs.
 #>
 
 param([switch]$DryRun)
 
-#region === Logging Setup ===
-$logRoot = Join-Path $env:ProgramData "WindowsHardeningLogs"
-$null = New-Item -Path $logRoot -ItemType Directory -Force
-$timestamp = (Get-Date -Format "yyyyMMdd_HHmmss")
-$logFile = "$logRoot\Hardening_$timestamp.log"
-$csvFile = "$logRoot\Summary_$timestamp.csv"
-$summary = @()
-
-function Log($msg, $lvl="INFO") {
-    $time = (Get-Date -Format "u")
-    $line = "[$time][$lvl] $msg"
-    switch ($lvl) {
-        "INFO" { Write-Host $msg -ForegroundColor Cyan }
-        "WARN" { Write-Host $msg -ForegroundColor Yellow }
-        "ERROR" { Write-Host $msg -ForegroundColor Red }
-        "OK" { Write-Host $msg -ForegroundColor Green }
-    }
-    Add-Content $logFile $line
+# === Setup Logging ===
+$ts = Get-Date -Format "yyyyMMdd_HHmmss"
+$logRoot = "$env:ProgramData\CyberPatriotLogs"
+New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
+$logFile = "$logRoot\Win11_Checklist_$ts.log"
+function Log($msg,[string]$lvl="INFO"){
+ $t=(Get-Date -Format u)
+ $c=@{INFO='Cyan';WARN='Yellow';ERROR='Red';OK='Green'}[$lvl]
+ Write-Host $msg -ForegroundColor $c
+ Add-Content $logFile "[$t][$lvl] $msg"
 }
+function Do($task,[scriptblock]$cmd){
+ if($DryRun){Log "DRYRUN: $task" "WARN"} else {try{&$cmd;Log "OK: $task" "OK"}catch{Log "ERR: $task $_" "ERROR"}}}
 
-function Add-Summary($setting,$old,$new,$status){
-    $summary += [PSCustomObject]@{
-        Timestamp=(Get-Date)
-        Setting=$setting; Previous=$old; New=$new; Status=$status
-    }
-}
-function Do-Action($name,[scriptblock]$action){
-    if ($DryRun){ Log "DryRun: would apply $name" "WARN"; Add-Summary $name "-" "Pending" "DryRun"; return }
-    try{ & $action; Log "$name applied" "OK"; Add-Summary $name "-" "-" "Applied" }
-    catch{ Log "$name failed: $($_.Exception.Message)" "ERROR"; Add-Summary $name "-" "-" "Failed" }
-}
+Log "=== CyberPatriot Windows 11 Checklist Script Start ==="
 
-Log "=== Starting Windows Hardening ($(if($DryRun){"DryRun Mode"}else{"Live Mode"})) ==="
-#endregion
-
-#region === 1. Password & Lockout Policy ===
-Do-Action "Password & Lockout Policy" {
-@"
+# === Password & Lockout Policy ===
+Do "Set password & lockout policy" {
+$inf=@"
 [Unicode]
 Unicode=yes
 [System Access]
-MinimumPasswordLength = 12
-MaximumPasswordAge = 90
-MinimumPasswordAge = 1
-PasswordComplexity = 1
-PasswordHistorySize = 24
+MinimumPasswordLength=10
+MaximumPasswordAge=60
+MinimumPasswordAge=1
+PasswordComplexity=1
+PasswordHistorySize=24
 [Lockout Policy]
-LockoutBadCount = 5
-ResetLockoutCount = 30
-LockoutDuration = 30
-"@ | Out-File "$env:TEMP\policy.inf" -Encoding ASCII
-secedit /configure /db "$env:windir\security\database\secedit.sdb" /cfg "$env:TEMP\policy.inf" /areas SECURITYPOLICY | Out-Null
+LockoutBadCount=10
+ResetLockoutCount=30
+LockoutDuration=30
+"@
+$path="$env:TEMP\cp_policy.inf"
+$inf|Out-File $path -Encoding ASCII
+secedit /configure /db "$env:windir\security\database\secedit.sdb" /cfg $path /areas SECURITYPOLICY | Out-Null
 }
 
-#region === 2. Firewall ===
-Do-Action "Enable Windows Firewall" {
-Import-Module NetSecurity
-foreach ($p in "Domain","Private","Public"){
-    Set-NetFirewallProfile -Profile $p -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Allow
-}
+# === SmartScreen ===
+Do "Enable SmartScreen" {
+Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" SmartScreenEnabled "RequireAdmin"
 }
 
-#region === 3. Windows Update ===
-Do-Action "Windows Update Service" {
-Set-Service -Name "wuauserv" -StartupType Automatic
-Start-Service "wuauserv" -ErrorAction SilentlyContinue
+# === Disable Wi-Fi Sense ===
+Do "Disable Wi-Fi Sense" {
+$path="HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config"
+New-Item -Path $path -Force | Out-Null
+Set-ItemProperty $path AutoConnectAllowedOEM 0
+Set-ItemProperty $path AutoConnectToWiFiSenseHotspots 0
 }
 
-#region === 4. Disable Insecure Services ===
-Do-Action "Disable SMBv1" {
-Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction SilentlyContinue | Out-Null
-}
-Do-Action "Disable Telnet" {
-Stop-Service "TlntSvr" -ErrorAction SilentlyContinue
-Set-Service "TlntSvr" -StartupType Disabled -ErrorAction SilentlyContinue
-}
-Do-Action "Disable RemoteRegistry" {
-Stop-Service "RemoteRegistry" -ErrorAction SilentlyContinue
-Set-Service "RemoteRegistry" -StartupType Disabled -ErrorAction SilentlyContinue
-}
-Do-Action "Disable AutoRun/AutoPlay" {
-$reg="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"
-New-Item -Path $reg -Force | Out-Null
-Set-ItemProperty $reg NoDriveTypeAutoRun 255
-Set-ItemProperty $reg NoDriveAutoRun 1
-}
-
-#region === 5. Enforce UAC ===
-Do-Action "User Account Control" {
+# === UAC (Max) ===
+Do "Set UAC to highest level" {
 $reg="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
-Set-ItemProperty $reg EnableLUA 1
 Set-ItemProperty $reg ConsentPromptBehaviorAdmin 2
+Set-ItemProperty $reg PromptOnSecureDesktop 1
+Set-ItemProperty $reg EnableLUA 1
 }
 
-#region === 6. Disable Guest/Test Accounts ===
-Do-Action "Disable Guest & Test Accounts" {
-Get-LocalUser | Where-Object {$_.Name -match 'guest|test|demo|sample'} | ForEach-Object {
-    Disable-LocalUser $_.Name -ErrorAction SilentlyContinue
+# === Disable IPv6 and unused network bindings ===
+Do "Disable IPv6 & network adapter extras" {
+Get-NetAdapter | ForEach-Object {
+Disable-NetAdapterBinding -Name $_.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+Disable-NetAdapterBinding -Name $_.Name -ComponentID ms_lltdio -ErrorAction SilentlyContinue
+Disable-NetAdapterBinding -Name $_.Name -ComponentID ms_lldp -ErrorAction SilentlyContinue
+Disable-NetAdapterBinding -Name $_.Name -ComponentID ms_server -ErrorAction SilentlyContinue
+Disable-NetAdapterBinding -Name $_.Name -ComponentID ms_pacer -ErrorAction SilentlyContinue
 }
 }
 
-#region === 7. Disable Remote Desktop ===
-Do-Action "Disable Remote Desktop" {
-Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" fDenyTSConnections 1
+# === Disable UPnP Port 1900 ===
+Do "Disable UPnP" {
+$reg="HKLM:\Software\Microsoft\DirectPlayNATHelp\DPNHUPnP"
+New-Item -Path $reg -Force | Out-Null
+Set-ItemProperty $reg UPnPMode 2
 }
 
-#region === 8. Ensure Defender Running ===
-Do-Action "Ensure Windows Defender" {
+# === Disable unnecessary services ===
+$services=@("upnphost","tlntsvr","SNMPTRAP","RemoteRegistry")
+foreach($svc in $services){Do "Disable service $svc" {Stop-Service $svc -ErrorAction SilentlyContinue;Set-Service $svc -StartupType Disabled -ErrorAction SilentlyContinue}}
+
+# === Disable SMBv1 ===
+Do "Disable SMBv1" {Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction SilentlyContinue | Out-Null}
+
+# === Shares check ===
+Log "Reminder: Only ADMIN$, C$, IPC$ should exist unless README says otherwise."
+
+# === Firewall - disable built-in app inbound rules ===
+$blockApps=@("MicrosoftEdge.exe","SearchApp.exe","HxTsr.exe","Microsoft.Photos.exe","XboxApp.exe")
+foreach($a in $blockApps){Do "Block inbound for $a" {
+New-NetFirewallRule -DisplayName "Block_$a" -Direction Inbound -Program "C:\Program Files\$a" -Action Block -ErrorAction SilentlyContinue
+}}
+
+# === Disable AutoPlay ===
+Do "Disable AutoPlay" {Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers" DisableAutoplay 1}
+
+# === Disable OneDrive startup ===
+Do "Disable OneDrive startup" {
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive" /v DisableFileSyncNGSC /t REG_DWORD /d 1 /f | Out-Null
+}
+
+# === Screen Saver ===
+Do "Configure screen saver to lock after 10 minutes" {
+$reg="HKCU:\Control Panel\Desktop"
+Set-ItemProperty $reg ScreenSaveActive 1
+Set-ItemProperty $reg ScreenSaverIsSecure 1
+Set-ItemProperty $reg ScreenSaveTimeOut 600
+}
+
+# === Enable auditing success/failure ===
+Do "Enable auditing Success/Failure" {
+foreach($s in "Logon","Account Management","Policy Change","Privilege Use","System"){
+auditpol /set /subcategory:$s /success:enable /failure:enable | Out-Null}
+}
+
+# === Windows Defender ===
+Do "Ensure Windows Defender running" {
 Set-Service WinDefend -StartupType Automatic -ErrorAction SilentlyContinue
 Start-Service WinDefend -ErrorAction SilentlyContinue
 }
 
-#region === 9. Enable Auditing ===
-Do-Action "Configure Auditing Policies" {
-$subs = "Logon","Account Management","Policy Change","Privilege Use","System"
-foreach ($s in $subs){ auditpol /set /subcategory:"$s" /success:enable /failure:enable | Out-Null }
+# === Lock Administrator & Guest accounts if required ===
+Do "Disable Guest & lock Admin if README says so" {
+Disable-LocalUser -Name Guest -ErrorAction SilentlyContinue
 }
 
-#region === 10. Final Report ===
-$summary | Export-Csv $csvFile -NoTypeInformation
-Log "=== Hardening complete ===" "OK"
-Log "Detailed log: $logFile"
-Log "CSV summary: $csvFile"
-Write-Host "`nTop Security Actions Summary:`n" -ForegroundColor Green
-$summary | Select Setting,Status | Format-Table -AutoSize
-#endregion
-
-# END
+Log "=== Checklist Script Completed. Review settings manually for Group Policy items ==="
+Log "Log saved: $logFile"
