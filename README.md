@@ -35,8 +35,9 @@ Make a folder named anything you want
 Put the Bat file the ps1 file and the Condition file in 
 
 Go into the bat file and right under "set working folder" you will see a directory replace the directory with the folder directory so 
-
 cd "C:\user\ExampleUser\Desktop\folder"   will be    cd "C:\user\you\Desktop\folder name"
+
+
 
 Change the Condition contents to the users in the format (Users, Acsess level) ex, (james, user)
 
