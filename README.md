@@ -18,3 +18,7 @@ MOST LIKELY WONT WORK BECAUSE WE HAD NO ACCESS TO A CP TESTING ROUND
 4️⃣ Paste in .\Secure-Windows.ps1 -Enforce 
 
 5️⃣ if its blocked use Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
+
+
+
+<<<< USERS >>>>
