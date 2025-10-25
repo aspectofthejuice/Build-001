@@ -1,4 +1,4 @@
-WINDOWS
+WINDOWS FIREWALL ETC
 
 
 1️⃣ Download the Secure-Windows.ps1 file and put it somewhere on your PC
