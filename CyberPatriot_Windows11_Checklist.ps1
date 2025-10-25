@@ -9,8 +9,6 @@
     If set, applies recommended security settings.
 .PARAMETER OutputReportPath
     Path to output the security report in HTML format.
-.NOTES
-    Author: 🔨🤖🔧 PowerShell | v1.0 | Oct 2025
 #>
 
 Param(
