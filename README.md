@@ -6,7 +6,7 @@ MOST LIKELY WONT WORK BECAUSE WE HAD NO ACCESS TO A CP TESTING ROUND
 
 
 
-<<<< OVERALL WINDOWS TWEAKS >>>> (download the UserSync.bat, Condition.txt, sync_log.txt, and set_password_gui.ps1)
+<<<< OVERALL WINDOWS TWEAKS >>>> 
 
 
 1️⃣ COPY the Secure-Windows.ps1 CODE in the top right
@@ -20,7 +20,7 @@ MOST LIKELY WONT WORK BECAUSE WE HAD NO ACCESS TO A CP TESTING ROUND
 
 
 
-<<<< USERS >>>>
+<<<< USERS >>>>(download the UserSync.bat, Condition.txt, sync_log.txt, and set_password_gui.ps1)
 
 
 (cool tip: use "wmic useraccount get name" in cmd to test)
