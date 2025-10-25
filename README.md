@@ -21,3 +21,4 @@ MOST LIKELY WONT WORK BECAUSE WE HAD NO ACCESS TO A CP TESTING ROUND
 
 
 <<<< USERS >>>>
+(cool tip: use "wmic useraccount get name" in cmd to test)
