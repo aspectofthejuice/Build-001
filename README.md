@@ -1,3 +1,5 @@
+I will upd this throughout the run because I will have access to the files
+
 WARNING 
 
 MOST LIKELY WONT WORK BECAUSE WE HAD NO ACCESS TO A CPat TESTING ROUND
