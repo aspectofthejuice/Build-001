@@ -1,0 +1,180 @@
+<#
+.SYNOPSIS
+    Windows Server Security Hardening and Audit Script
+.DESCRIPTION
+    Audits and enforces critical Windows Server security settings.
+.PARAMETER ReportOnly
+    Audit server configuration without making changes.
+.PARAMETER Enforce
+    Apply recommended security hardening actions.
+.PARAMETER OutputReportPath
+    File path for the HTML/JSON/CSV report.
+#>
+
+Param(
+    [switch]$ReportOnly,
+    [switch]$Enforce,
+    [string]$OutputReportPath = ".\ServerSecurityAuditReport.html"
+)
+
+$Global:SecurityFindings = @()
+
+function Write-Log {
+    param ([string]$Message,[string]$Level="INFO")
+    switch ($Level) {
+        "INFO"  { Write-Host "[INFO]    $Message" -ForegroundColor Cyan }
+        "OK"    { Write-Host "[OK]      $Message" -ForegroundColor Green }
+        "WARN"  { Write-Host "[WARN]    $Message" -ForegroundColor Yellow }
+        "ERROR" { Write-Host "[ERROR]   $Message" -ForegroundColor Red }
+    }
+}
+
+function Add-Finding {
+    param ([string]$Category,[string]$Item,[string]$Status,[string]$Recommendation)
+    $Global:SecurityFindings += [PSCustomObject]@{
+        Category=$Category;Item=$Item;Status=$Status;Recommendation=$Recommendation
+    }
+}
+
+# ======== SERVER-SPECIFIC AUDITS ========
+
+function Audit-RemoteDesktop {
+    Write-Log "Auditing Remote Desktop..." "INFO"
+    $rdp = Get-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -ErrorAction SilentlyContinue
+    if ($rdp.fDenyTSConnections -eq 0) {
+        Add-Finding "Remote Desktop" "RDP Access" "Enabled" "Ensure NLA is enabled and use RDP only if required."
+        $nla = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -ErrorAction SilentlyContinue
+        if ($nla.UserAuthentication -ne 1) {
+            Add-Finding "Remote Desktop" "Network Level Authentication" "Disabled" "Enable NLA for RDP sessions."
+            if ($Enforce) {
+                Write-Log "Enabling NLA..." "WARN"
+                Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1
+            }
+        }
+    } else {
+        Add-Finding "Remote Desktop" "RDP Access" "Disabled" "No action required."
+    }
+}
+
+function Audit-SMBShares {
+    Write-Log "Checking administrative shares (C$, ADMIN$, IPC$)..." "INFO"
+    $regPath="HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
+    $autoShare = Get-ItemProperty -Path $regPath -Name AutoShareServer -ErrorAction SilentlyContinue
+    if ($autoShare.AutoShareServer -eq 0) {
+        Add-Finding "SMB Shares" "Admin Shares" "Disabled" "OK - admin shares disabled."
+    } else {
+        Add-Finding "SMB Shares" "Admin Shares" "Enabled" "Consider disabling administrative shares for tighter security."
+        if ($Enforce) {
+            Set-ItemProperty -Path $regPath -Name AutoShareServer -Value 0
+            Write-Log "Disabled administrative shares." "OK"
+        }
+    }
+}
+
+function Audit-Firewall {
+    Write-Log "Auditing Windows Firewall..." "INFO"
+    $profiles = Get-NetFirewallProfile
+    foreach ($p in $profiles) {
+        if (-not $p.Enabled) {
+            Add-Finding "Firewall" "$($p.Name)" "Disabled" "Enable firewall for this profile."
+            if ($Enforce) {
+                Set-NetFirewallProfile -Profile $p.Name -Enabled $true
+                Write-Log "Enabled $($p.Name) firewall." "OK"
+            }
+        } else {
+            Add-Finding "Firewall" "$($p.Name)" "Enabled" "OK"
+        }
+    }
+}
+
+function Audit-WindowsUpdates {
+    Write-Log "Auditing Windows Update settings..." "INFO"
+    try {
+        $wuSettings = Get-ItemProperty "HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate\AU" -ErrorAction SilentlyContinue
+        if ($wuSettings.NoAutoUpdate -eq 1) {
+            Add-Finding "Patch Management" "Automatic Updates" "Disabled" "Enable automatic updates."
+            if ($Enforce) {
+                Write-Log "Enabling automatic updates..." "WARN"
+                Set-ItemProperty "HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name NoAutoUpdate -Value 0
+            }
+        } else {
+            Add-Finding "Patch Management" "Automatic Updates" "Enabled" "OK"
+        }
+    } catch {
+        Add-Finding "Patch Management" "Windows Update" "Check Failed" "Verify group policy settings."
+    }
+}
+
+function Audit-Defender {
+    Write-Log "Checking Windows Defender..." "INFO"
+    try {
+        $status = Get-MpComputerStatus
+        if ($status.RealTimeProtectionEnabled) {
+            Add-Finding "Anti-Malware" "Windows Defender" "Enabled" "OK"
+        } else {
+            Add-Finding "Anti-Malware" "Windows Defender" "Disabled" "Enable Defender protection."
+            if ($Enforce) {
+                Set-MpPreference -DisableRealtimeMonitoring $false
+                Write-Log "Enabled Defender real-time protection." "OK"
+            }
+        }
+    } catch {
+        Add-Finding "Anti-Malware" "Windows Defender" "Unavailable" "Ensure Defender feature is installed."
+    }
+}
+
+function Audit-AdminAccounts {
+    Write-Log "Checking for additional local admin accounts..." "INFO"
+    $admins = Get-LocalGroupMember -Group "Administrators"
+    foreach ($a in $admins) {
+        if ($a.Name -notmatch "Administrator|Domain Admins") {
+            Add-Finding "Privilege Management" "User $($a.Name)" "Extra Admin" "Remove unnecessary admin access."
+            if ($Enforce) {
+                try {
+                    Remove-LocalGroupMember -Group "Administrators" -Member $a.Name -ErrorAction Stop
+                    Write-Log "Removed $($a.Name) from Administrators." "OK"
+                } catch {
+                    Write-Log "Failed to remove $($a.Name): $_" "ERROR"
+                }
+            }
+        }
+    }
+}
+
+# ======== REPORT FUNCTIONS ========
+
+function Generate-Report {
+    Write-Log "Generating report..." "INFO"
+    $htmlPath = [System.IO.Path]::ChangeExtension($OutputReportPath, ".html")
+    $jsonPath = [System.IO.Path]::ChangeExtension($OutputReportPath, ".json")
+    $csvPath  = [System.IO.Path]::ChangeExtension($OutputReportPath, ".csv")
+
+    $html = "<html><head><title>Server Security Audit</title></head><body><h1>Server Security Audit Report</h1><table border='1'><tr><th>Category</th><th>Item</th><th>Status</th><th>Recommendation</th></tr>"
+    foreach ($f in $Global:SecurityFindings) {
+        $html += "<tr><td>$($f.Category)</td><td>$($f.Item)</td><td>$($f.Status)</td><td>$($f.Recommendation)</td></tr>"
+    }
+    $html += "</table></body></html>"
+
+    $html | Out-File $htmlPath -Encoding UTF8
+    $Global:SecurityFindings | ConvertTo-Json -Depth 3 | Out-File $jsonPath -Encoding UTF8
+    $Global:SecurityFindings | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+    Write-Log "Report saved: $htmlPath" "OK"
+}
+
+# ======== MAIN EXECUTION ========
+
+Write-Host "`n==== Windows Server Security Hardening Toolkit ====" -ForegroundColor Magenta
+Start-Transcript -Path ".\ServerAudit-$(Get-Date -Format yyyyMMdd_HHmmss).log" -Append
+
+Audit-RemoteDesktop
+Audit-SMBShares
+Audit-Firewall
+Audit-WindowsUpdates
+Audit-Defender
+Audit-AdminAccounts
+
+Generate-Report
+Stop-Transcript
+
+Write-Host "`n✅ Server security audit complete. Reports generated at: $OutputReportPath" -ForegroundColor Green
