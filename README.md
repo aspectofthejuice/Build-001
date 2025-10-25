@@ -28,6 +28,7 @@ MOST LIKELY WONT WORK BECAUSE WE HAD NO ACCESS TO A CPat TESTING ROUND
 
 (helps to use File name extensions in the view part of file manager)
 
+
 1️⃣Download all the code and make sure that all the extensions are correct
 
 2️⃣Make a folder named anything you want
