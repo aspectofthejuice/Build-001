@@ -6,7 +6,7 @@ MOST LIKELY WONT WORK BECAUSE WE HAD NO ACCESS TO A CP TESTING ROUND
 
 
 
-<<<< OVERALL WINDOWS TWEAKS >>>>
+<<<< OVERALL WINDOWS TWEAKS >>>> (download the UserSync.bat, Condition.txt, sync_log.txt, and set_password_gui.ps1)
 
 
 1️⃣ COPY the Secure-Windows.ps1 CODE in the top right
