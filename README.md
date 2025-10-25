@@ -28,20 +28,20 @@ MOST LIKELY WONT WORK BECAUSE WE HAD NO ACCESS TO A CP TESTING ROUND
 
 (helps to use File name extensions in the view part of file manager)
 
-Download all the code and make sure that all the extensions are correct
+1️⃣Download all the code and make sure that all the extensions are correct
 
-Make a folder named anything you want
+2️⃣Make a folder named anything you want
 
-Put the Bat file the ps1 file and the Condition file in 
+3️⃣Put the Bat file the ps1 file and the Condition file in 
 
-Go into the bat file and right under "set working folder" you will see a directory replace the directory with the folder directory so 
+4️⃣ Go into the bat file and right under "set working folder" you will see a directory replace the directory with the folder directory so 
 cd "C:\user\ExampleUser\Desktop\folder"   will be    cd "C:\user\you\Desktop\folder name"
 
 
 
-Change the Condition contents to the users in the format (Users, Acsess level) ex, (james, user)
+5️⃣Change the Condition contents to the users in the format (Users, Acsess level) ex, (james, user)
 
-Lastly run the bat file as a administrator
+6️⃣Lastly run the bat file as a administrator
 
 
 
