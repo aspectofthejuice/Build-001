@@ -1,212 +1,588 @@
 <#
 .SYNOPSIS
-    Windows Security Hardening and Audit Script
+    CyberPatriot Windows Hardening Tool with GUI
 .DESCRIPTION
-    Implements a variety of Windows security best practices in audit or enforce mode.
-.PARAMETER ReportOnly
-    If set, performs auditing only without making changes.
-.PARAMETER Enforce
-    If set, applies recommended security settings.
-.PARAMETER OutputReportPath
-    Path to output the security report in HTML format.
+    Safe, auditable Windows hardening script for CyberPatriot competitions.
 #>
 
-Param(
-    [switch]$ReportOnly,
-    [switch]$Enforce,
-    [string]$OutputReportPath = ".\SecurityAuditReport.html"
+[CmdletBinding()]
+param(
+    [string]$BackupPath = "C:\CyberPatriotLogs"
 )
 
-# Global array to collect report data
-$Global:SecurityFindings = @()
+# Require Administrator
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-NOT $isAdmin) {
+    Add-Type -AssemblyName System.Windows.Forms
+    [System.Windows.Forms.MessageBox]::Show("This script requires Administrator privileges. Please run as Administrator.", "Elevation Required", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+    exit 1
+}
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Global variables
+$script:LogFolder = Join-Path $BackupPath (Get-Date -Format "yyyy-MM-dd_HHmmss")
+$script:LogFile = Join-Path $script:LogFolder "hardening.log"
+$script:JsonReport = Join-Path $script:LogFolder "summary.json"
+$script:ComplianceReport = @{}
+$script:OutputBox = $null
+$script:ReadmeAppsChecked = $false
+$script:ReadmeUsersChecked = $false
+$script:ReadmeContent = ""
+$script:ReadmeUserContent = ""
+
+# Create log directory
+New-Item -ItemType Directory -Path $script:LogFolder -Force | Out-Null
 
 function Write-Log {
-    param (
-        [string]$Message,
-        [string]$Level = "INFO"
-    )
-    switch ($Level) {
-        "INFO"    { Write-Host "[INFO]    $Message" -ForegroundColor Cyan }
-        "OK"      { Write-Host "[OK]      $Message" -ForegroundColor Green }
-        "WARN"    { Write-Host "[WARNING] $Message" -ForegroundColor Yellow }
-        "ERROR"   { Write-Host "[ERROR]   $Message" -ForegroundColor Red }
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "[$timestamp] [$Level] $Message"
+    Add-Content -Path $script:LogFile -Value $logMessage
+    
+    if ($script:OutputBox -and $script:OutputBox.IsHandleCreated) {
+        try {
+            $script:OutputBox.Invoke([Action]{
+                $script:OutputBox.AppendText("$logMessage`r`n")
+                $script:OutputBox.ScrollToCaret()
+            })
+        } catch {
+            # Silently fail
+        }
+    }
+    
+    if ($Level -eq "ERROR") {
+        Write-Error $Message
     }
 }
 
-function Add-Finding {
-    param (
-        [string]$Category,
-        [string]$Item,
-        [string]$Status,
-        [string]$Recommendation
-    )
-    $Global:SecurityFindings += [PSCustomObject]@{
-        Category       = $Category
-        Item           = $Item
-        Status         = $Status
-        Recommendation = $Recommendation
+function Show-Confirmation {
+    param([string]$Message, [string]$Title = "Confirm Action")
+    $result = [System.Windows.Forms.MessageBox]::Show($Message, $Title, [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+    return ($result -eq [System.Windows.Forms.DialogResult]::Yes)
+}
+
+function Set-PasswordPolicy {
+    param([string]$Mode)
+    
+    Write-Log "=== Password Policy ===" "INFO"
+    $script:ComplianceReport['PasswordPolicy'] = @{}
+    
+    try {
+        $secpolPath = "$env:TEMP\secpol.cfg"
+        secedit /export /cfg $secpolPath 2>&1 | Out-Null
+        
+        if (-not (Test-Path $secpolPath)) {
+            Write-Log "Failed to export security policy" "ERROR"
+            return
+        }
+        
+        $content = Get-Content $secpolPath -ErrorAction Stop
+        
+        $minLenMatch = $content | Select-String "MinimumPasswordLength\s*=\s*(\d+)"
+        $currentMinLen = if ($minLenMatch) { $minLenMatch.Matches[0].Groups[1].Value } else { "0" }
+        
+        Write-Log "Current Min Password Length: $currentMinLen"
+        
+        if ($Mode -eq 'Audit') {
+            $compliant = ([int]$currentMinLen -ge 12)
+            $script:ComplianceReport['PasswordPolicy']['Status'] = if ($compliant) { "Compliant" } else { "Non-Compliant" }
+        }
+        elseif ($Mode -eq 'Enforce') {
+            if (Show-Confirmation "Set password policy to: Min Length 12, Complexity Enabled, Max Age 90 days?") {
+                try {
+                    $tempFile = "$env:TEMP\secpol_new.cfg"
+                    $content -replace "MinimumPasswordLength\s*=\s*\d+", "MinimumPasswordLength = 12" `
+                             -replace "MaximumPasswordAge\s*=\s*\d+", "MaximumPasswordAge = 90" `
+                             -replace "MinimumPasswordAge\s*=\s*\d+", "MinimumPasswordAge = 1" `
+                             -replace "PasswordHistorySize\s*=\s*\d+", "PasswordHistorySize = 24" `
+                             -replace "PasswordComplexity\s*=\s*\d+", "PasswordComplexity = 1" | Set-Content $tempFile
+                    
+                    secedit /configure /db "$env:TEMP\secedit.sdb" /cfg $tempFile /areas SECURITYPOLICY /quiet 2>&1 | Out-Null
+                    Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+                    
+                    Write-Log "Password policy configured" "INFO"
+                    $script:ComplianceReport['PasswordPolicy']['Status'] = "Enforced"
+                } catch {
+                    Write-Log "Error: $_" "ERROR"
+                }
+            }
+        }
+        
+        Remove-Item "$env:TEMP\secpol.cfg" -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-Log "Error in password policy: $_" "ERROR"
     }
 }
 
-# ---------------------------- MODULES ----------------------------
+function Set-BuiltInAccounts {
+    param([string]$Mode)
+    
+    Write-Log "=== User Accounts ===" "INFO"
+    $script:ComplianceReport['Accounts'] = @{}
+    
+    # Disable Guest
+    $guest = Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
+    if ($guest -and $guest.Enabled) {
+        if ($Mode -eq 'Enforce') {
+            if (Show-Confirmation "Disable Guest account?") {
+                Disable-LocalUser -Name "Guest"
+                Write-Log "Guest account disabled" "INFO"
+            }
+        } else {
+            Write-Log "Guest account is enabled" "WARN"
+        }
+    }
+    
+    # List all users
+    $allUsers = Get-LocalUser
+    Write-Log "Total local users: $($allUsers.Count)"
+    foreach ($user in $allUsers) {
+        Write-Log "  User: $($user.Name) - Enabled: $($user.Enabled)"
+    }
+    
+    # Check for unauthorized users in Enforce mode
+    if ($Mode -eq 'Enforce') {
+        Find-UnauthorizedUsers
+    }
+}
 
-function Audit-UserAccountPolicies {
-    Write-Log "Auditing User Account Policies..." "INFO"
-    $policy = Get-LocalUser | Where-Object { $_.Enabled -eq $true }
-
-    # Enforce password policy (via SecPol)
-    $secedit = secedit /export /cfg "$env:TEMP\secpol.cfg" | Out-Null
-    $lines = Get-Content "$env:TEMP\secpol.cfg"
-
-    $pwdComplexity = ($lines | Where-Object { $_ -match "PasswordComplexity" }) -replace ".*=", "" | ForEach-Object { $_.Trim() }
-
-    if ($pwdComplexity -ne "1") {
-        Add-Finding -Category "User Account Policies" -Item "Password Complexity" -Status "Non-Compliant" -Recommendation "Enable password complexity."
-        if ($Enforce) {
-            Write-Log "Enabling password complexity..." "WARN"
-            secedit /configure /db secedit.sdb /cfg "$env:TEMP\secpol.cfg" /areas SECURITYPOLICY | Out-Null
+function Find-UnauthorizedUsers {
+    Write-Log "=== Checking for Unauthorized Users ===" "INFO"
+    
+    # Prompt for README
+    $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+    $openFileDialog.Title = "Select README (lists authorized users)"
+    $openFileDialog.Filter = "Text Files (*.txt;*.md)|*.txt;*.md|All Files (*.*)|*.*"
+    $openFileDialog.InitialDirectory = [Environment]::GetFolderPath("Desktop")
+    
+    $result = $openFileDialog.ShowDialog()
+    
+    $readmeContent = ""
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+        try {
+            $readmeContent = Get-Content $openFileDialog.FileName -Raw
+            Write-Log "README loaded successfully"
+        } catch {
+            Write-Log "Could not read README" "ERROR"
         }
     } else {
-        Add-Finding -Category "User Account Policies" -Item "Password Complexity" -Status "OK" -Recommendation "Already enforced."
+        Write-Log "No README selected - skipping user check"
+        return
     }
-
-    Remove-Item "$env:TEMP\secpol.cfg" -ErrorAction SilentlyContinue
-}
-
-function Audit-LocalAdministrators {
-    Write-Log "Checking local administrators group..." "INFO"
-    $admins = Get-LocalGroupMember -Group "Administrators"
-
-    foreach ($admin in $admins) {
-        if ($admin.Name -ne "$env:COMPUTERNAME\Administrator" -and $admin.Name -ne "BUILTIN\Administrators") {
-            Add-Finding -Category "Privilege Management" -Item "User $($admin.Name)" -Status "Has Admin Access" -Recommendation "Evaluate necessity of admin access."
+    
+    # Get all users
+    $allUsers = Get-LocalUser
+    
+    # System accounts to always skip
+    $systemAccounts = @('Administrator', 'DefaultAccount', 'Guest', 'WDAGUtilityAccount')
+    
+    # Current user
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name.Split('\')[-1]
+    
+    # Find unauthorized
+    $unauthorized = @()
+    
+    foreach ($user in $allUsers) {
+        $userName = $user.Name
+        
+        # Skip system accounts
+        if ($systemAccounts -contains $userName) { continue }
+        
+        # Skip current user
+        if ($userName -eq $currentUser) { continue }
+        
+        # Check if in README
+        $inReadme = $readmeContent -match [regex]::Escape($userName)
+        
+        if (-not $inReadme) {
+            $unauthorized += $user
+            Write-Log "Unauthorized user found: $userName" "WARN"
         }
     }
-
-    if ($Enforce) {
-        # Optional enforcement: removing unneeded admins (dangerous if automated)
-        Write-Log "Enforce mode: Please manually review and remove unnecessary administrators to avoid lockout." "WARN"
+    
+    if ($unauthorized.Count -eq 0) {
+        Write-Log "No unauthorized users found"
+        [System.Windows.Forms.MessageBox]::Show("All users are authorized!", "Check Complete", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        return
     }
+    
+    # Show removal dialog
+    Show-UserRemovalDialog -Users $unauthorized
 }
 
-function Audit-WindowsUpdates {
-    Write-Log "Checking for missing Windows updates..." "INFO"
-
-    try {
-        $Session = New-Object -ComObject Microsoft.Update.Session
-        $Searcher = $Session.CreateUpdateSearcher()
-        $Results = $Searcher.Search("IsInstalled=0")
-
-        if ($Results.Updates.Count -gt 0) {
-            Add-Finding -Category "Patch Management" -Item "$($Results.Updates.Count) Updates Missing" -Status "Non-Compliant" -Recommendation "Install latest Windows Updates."
-            if ($Enforce) {
-                Write-Log "Enforce mode: Please use Windows Update UI or WSUS to install patches safely." "WARN"
+function Show-UserRemovalDialog {
+    param($Users)
+    
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Unauthorized Users Found"
+    $form.Size = New-Object System.Drawing.Size(600, 400)
+    $form.StartPosition = "CenterScreen"
+    
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Select users to DELETE (This cannot be undone!):"
+    $label.Location = New-Object System.Drawing.Point(10, 10)
+    $label.Size = New-Object System.Drawing.Size(570, 30)
+    $label.Font = New-Object System.Drawing.Font("Arial", 10, [System.Drawing.FontStyle]::Bold)
+    $label.ForeColor = [System.Drawing.Color]::Red
+    $form.Controls.Add($label)
+    
+    $listBox = New-Object System.Windows.Forms.CheckedListBox
+    $listBox.Location = New-Object System.Drawing.Point(10, 50)
+    $listBox.Size = New-Object System.Drawing.Size(570, 250)
+    
+    foreach ($user in $Users) {
+        [void]$listBox.Items.Add("$($user.Name) - Enabled: $($user.Enabled)")
+    }
+    
+    $form.Controls.Add($listBox)
+    
+    # Delete button
+    $deleteBtn = New-Object System.Windows.Forms.Button
+    $deleteBtn.Text = "Delete Selected"
+    $deleteBtn.Location = New-Object System.Drawing.Point(10, 315)
+    $deleteBtn.Size = New-Object System.Drawing.Size(130, 30)
+    $deleteBtn.BackColor = [System.Drawing.Color]::Red
+    $deleteBtn.ForeColor = [System.Drawing.Color]::White
+    $deleteBtn.Add_Click({
+        $selected = @()
+        foreach ($item in $listBox.CheckedItems) {
+            $userName = $item.ToString().Split(' ')[0]
+            $selected += $userName
+        }
+        
+        if ($selected.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("No users selected", "Info")
+            return
+        }
+        
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "DELETE $($selected.Count) user(s)?`n`n$($selected -join "`n")`n`nThis CANNOT be undone!",
+            "Confirm Deletion",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        
+        if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+            foreach ($userName in $selected) {
+                try {
+                    Remove-LocalUser -Name $userName
+                    Write-Log "Deleted user: $userName" "INFO"
+                } catch {
+                    Write-Log "Failed to delete $userName : $_" "ERROR"
+                }
             }
-        } else {
-            Add-Finding -Category "Patch Management" -Item "Windows Update" -Status "OK" -Recommendation "Fully patched."
+            [System.Windows.Forms.MessageBox]::Show("Deletion complete", "Done")
+            $form.Close()
         }
-    } catch {
-        Write-Log "Unable to check Windows Update. COM object failure." "ERROR"
-    }
-}
-
-function Audit-LoggingAndAuditing {
-    Write-Log "Checking audit policy settings..." "INFO"
-    $categories = @("Logon", "Object Access", "Privilege Use", "Process Creation")
-    foreach ($cat in $categories) {
-        $policy = (AuditPol /get /subcategory:"$cat") 2>&1
-        if ($policy -match "No auditing") {
-            Add-Finding -Category "Logging and Auditing" -Item "$cat" -Status "Not Audited" -Recommendation "Enable auditing for this category."
-            if ($Enforce) {
-                AuditPol /set /subcategory:"$cat" /success:enable /failure:enable | Out-Null
-                Write-Log "Enabled auditing for $cat" "OK"
+    })
+    $form.Controls.Add($deleteBtn)
+    
+    # Disable button
+    $disableBtn = New-Object System.Windows.Forms.Button
+    $disableBtn.Text = "Disable Selected"
+    $disableBtn.Location = New-Object System.Drawing.Point(150, 315)
+    $disableBtn.Size = New-Object System.Drawing.Size(130, 30)
+    $disableBtn.BackColor = [System.Drawing.Color]::Orange
+    $disableBtn.ForeColor = [System.Drawing.Color]::White
+    $disableBtn.Add_Click({
+        $selected = @()
+        foreach ($item in $listBox.CheckedItems) {
+            $userName = $item.ToString().Split(' ')[0]
+            $selected += $userName
+        }
+        
+        if ($selected.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("No users selected", "Info")
+            return
+        }
+        
+        foreach ($userName in $selected) {
+            try {
+                Disable-LocalUser -Name $userName
+                Write-Log "Disabled user: $userName" "INFO"
+            } catch {
+                Write-Log "Failed to disable $userName : $_" "ERROR"
             }
-        } else {
-            Add-Finding -Category "Logging and Auditing" -Item "$cat" -Status "Audited" -Recommendation "Already enabled."
         }
-    }
+        [System.Windows.Forms.MessageBox]::Show("Users disabled", "Done")
+        $form.Close()
+    })
+    $form.Controls.Add($disableBtn)
+    
+    # Cancel button
+    $cancelBtn = New-Object System.Windows.Forms.Button
+    $cancelBtn.Text = "Cancel"
+    $cancelBtn.Location = New-Object System.Drawing.Point(290, 315)
+    $cancelBtn.Size = New-Object System.Drawing.Size(100, 30)
+    $cancelBtn.Add_Click({ $form.Close() })
+    $form.Controls.Add($cancelBtn)
+    
+    [void]$form.ShowDialog()
 }
 
-function Audit-WindowsFirewall {
-    Write-Log "Auditing Windows Firewall..." "INFO"
+function Find-UnauthorizedApps {
+    param([string]$Mode)
+    
+    Write-Log "=== Checking for Unauthorized Apps ===" "INFO"
+    
+    # Prompt for README
+    $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+    $openFileDialog.Title = "Select README (lists authorized apps)"
+    $openFileDialog.Filter = "Text Files (*.txt;*.md)|*.txt;*.md|All Files (*.*)|*.*"
+    $openFileDialog.InitialDirectory = [Environment]::GetFolderPath("Desktop")
+    
+    $result = $openFileDialog.ShowDialog()
+    
+    $readmeContent = ""
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+        try {
+            $readmeContent = Get-Content $openFileDialog.FileName -Raw
+            Write-Log "README loaded for app check"
+        } catch {
+            Write-Log "Could not read README" "ERROR"
+        }
+    } else {
+        Write-Log "No README selected"
+        return
+    }
+    
+    # Known bad apps
+    $badApps = @(
+        'Wireshark', 'Nmap', 'Metasploit', 'TeamViewer', 'AnyDesk',
+        'BitTorrent', 'uTorrent', 'Steam', 'Discord', 'Minecraft'
+    )
+    
+    # Get installed apps
+    $installed = @()
+    $paths = @(
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    
+    foreach ($path in $paths) {
+        try {
+            $apps = Get-ItemProperty $path -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DisplayName }
+            $installed += $apps
+        } catch {}
+    }
+    
+    Write-Log "Found $($installed.Count) installed apps"
+    
+    # Find unauthorized
+    $unauthorized = @()
+    
+    foreach ($app in $installed) {
+        $appName = $app.DisplayName
+        
+        # Check if it's a known bad app
+        $isBad = $false
+        foreach ($bad in $badApps) {
+            if ($appName -like "*$bad*") {
+                $isBad = $true
+                break
+            }
+        }
+        
+        # Check if in README
+        $inReadme = $readmeContent -match [regex]::Escape($appName)
+        
+        if ($isBad -and -not $inReadme) {
+            $unauthorized += $app
+            Write-Log "Unauthorized app: $appName" "WARN"
+        }
+    }
+    
+    Write-Log "Found $($unauthorized.Count) unauthorized apps"
+    
+    if ($unauthorized.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("No unauthorized apps found!", "Check Complete")
+        return
+    }
+    
+    # Save list
+    $listFile = Join-Path $script:LogFolder "unauthorized_apps.txt"
+    $unauthorized | Select-Object DisplayName, Publisher | Out-File $listFile
+    Write-Log "Unauthorized apps saved to: $listFile"
+    
+    [System.Windows.Forms.MessageBox]::Show("Found $($unauthorized.Count) unauthorized apps!`nSee log for details.", "Unauthorized Apps Found", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+}
+
+function Set-Firewall {
+    param([string]$Mode)
+    
+    Write-Log "=== Firewall ===" "INFO"
+    
     $profiles = Get-NetFirewallProfile
     foreach ($profile in $profiles) {
-        if ($profile.Enabled -eq $false) {
-            Add-Finding -Category "Firewall" -Item "$($profile.Name)" -Status "Disabled" -Recommendation "Enable the firewall for this profile."
-            if ($Enforce) {
-                Set-NetFirewallProfile -Profile $profile.Name -Enabled True
-                Write-Log "Enabled firewall for $($profile.Name)" "OK"
+        Write-Log "$($profile.Name): Enabled=$($profile.Enabled)"
+    }
+    
+    if ($Mode -eq 'Enforce') {
+        if (Show-Confirmation "Enable firewall for all profiles?") {
+            Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True
+            Write-Log "Firewall enabled" "INFO"
+        }
+    }
+}
+
+function Set-WindowsDefender {
+    param([string]$Mode)
+    
+    Write-Log "=== Windows Defender ===" "INFO"
+    
+    $status = Get-MpComputerStatus -ErrorAction SilentlyContinue
+    if ($status) {
+        Write-Log "RealTime Protection: $($status.RealTimeProtectionEnabled)"
+        
+        if ($Mode -eq 'Enforce' -and -not $status.RealTimeProtectionEnabled) {
+            if (Show-Confirmation "Enable Windows Defender?") {
+                Set-MpPreference -DisableRealtimeMonitoring $false
+                Write-Log "Defender enabled" "INFO"
             }
-        } else {
-            Add-Finding -Category "Firewall" -Item "$($profile.Name)" -Status "OK" -Recommendation "Firewall enabled."
         }
     }
 }
 
-function Audit-SystemIntegrity {
-    Write-Log "Checking system file integrity..." "INFO"
-    $sfc = sfc /scannow
-    Add-Finding -Category "System Integrity" -Item "System File Check" -Status "Executed" -Recommendation "Review SFC logs for details."
-
-    if ($Enforce) {
-        DISM /Online /Cleanup-Image /RestoreHealth | Out-Null
-        Write-Log "DISM health check complete." "OK"
-    }
+function Export-Report {
+    Write-Log "=== Generating Report ===" "INFO"
+    $script:ComplianceReport | ConvertTo-Json -Depth 10 | Out-File $script:JsonReport
+    Write-Log "Report saved: $script:JsonReport"
 }
 
-function Audit-WindowsDefender {
-    Write-Log "Checking Windows Defender status..." "INFO"
-    $status = Get-MpComputerStatus
-    if ($status.AntispywareEnabled -and $status.RealTimeProtectionEnabled) {
-        Add-Finding -Category "Anti-Malware" -Item "Windows Defender" -Status "Running" -Recommendation "Protection is active."
-    } else {
-        Add-Finding -Category "Anti-Malware" -Item "Windows Defender" -Status "Disabled" -Recommendation "Enable real-time protection."
-        if ($Enforce) {
-            Set-MpPreference -DisableRealtimeMonitoring $false
-            Write-Log "Enabled real-time protection." "OK"
-        }
+# GUI
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "CyberPatriot Hardening Tool"
+$form.Size = New-Object System.Drawing.Size(900, 700)
+$form.StartPosition = "CenterScreen"
+
+$title = New-Object System.Windows.Forms.Label
+$title.Text = "CyberPatriot Windows Hardening Tool"
+$title.Font = New-Object System.Drawing.Font("Arial", 14, [System.Drawing.FontStyle]::Bold)
+$title.Location = New-Object System.Drawing.Point(20, 10)
+$title.Size = New-Object System.Drawing.Size(850, 30)
+$title.TextAlign = "MiddleCenter"
+$form.Controls.Add($title)
+
+$optionsGroup = New-Object System.Windows.Forms.GroupBox
+$optionsGroup.Text = "Options"
+$optionsGroup.Location = New-Object System.Drawing.Point(20, 50)
+$optionsGroup.Size = New-Object System.Drawing.Size(400, 250)
+$form.Controls.Add($optionsGroup)
+
+$script:chkPassword = New-Object System.Windows.Forms.CheckBox
+$script:chkPassword.Text = "Password Policy"
+$script:chkPassword.Location = New-Object System.Drawing.Point(15, 25)
+$script:chkPassword.Size = New-Object System.Drawing.Size(350, 20)
+$script:chkPassword.Checked = $true
+$optionsGroup.Controls.Add($script:chkPassword)
+
+$script:chkAccounts = New-Object System.Windows.Forms.CheckBox
+$script:chkAccounts.Text = "Check User Accounts (vs README)"
+$script:chkAccounts.Location = New-Object System.Drawing.Point(15, 50)
+$script:chkAccounts.Size = New-Object System.Drawing.Size(350, 20)
+$script:chkAccounts.Checked = $true
+$optionsGroup.Controls.Add($script:chkAccounts)
+
+$script:chkApps = New-Object System.Windows.Forms.CheckBox
+$script:chkApps.Text = "Check Applications (vs README)"
+$script:chkApps.Location = New-Object System.Drawing.Point(15, 75)
+$script:chkApps.Size = New-Object System.Drawing.Size(350, 20)
+$script:chkApps.Checked = $true
+$optionsGroup.Controls.Add($script:chkApps)
+
+$script:chkFirewall = New-Object System.Windows.Forms.CheckBox
+$script:chkFirewall.Text = "Firewall"
+$script:chkFirewall.Location = New-Object System.Drawing.Point(15, 100)
+$script:chkFirewall.Size = New-Object System.Drawing.Size(350, 20)
+$script:chkFirewall.Checked = $true
+$optionsGroup.Controls.Add($script:chkFirewall)
+
+$script:chkDefender = New-Object System.Windows.Forms.CheckBox
+$script:chkDefender.Text = "Windows Defender"
+$script:chkDefender.Location = New-Object System.Drawing.Point(15, 125)
+$script:chkDefender.Size = New-Object System.Drawing.Size(350, 20)
+$script:chkDefender.Checked = $true
+$optionsGroup.Controls.Add($script:chkDefender)
+
+# Mode
+$modeGroup = New-Object System.Windows.Forms.GroupBox
+$modeGroup.Text = "Mode"
+$modeGroup.Location = New-Object System.Drawing.Point(440, 50)
+$modeGroup.Size = New-Object System.Drawing.Size(420, 100)
+$form.Controls.Add($modeGroup)
+
+$script:radioAudit = New-Object System.Windows.Forms.RadioButton
+$script:radioAudit.Text = "Audit Only"
+$script:radioAudit.Location = New-Object System.Drawing.Point(15, 25)
+$script:radioAudit.Size = New-Object System.Drawing.Size(390, 20)
+$script:radioAudit.Checked = $true
+$modeGroup.Controls.Add($script:radioAudit)
+
+$script:radioEnforce = New-Object System.Windows.Forms.RadioButton
+$script:radioEnforce.Text = "Enforce (with confirmations)"
+$script:radioEnforce.Location = New-Object System.Drawing.Point(15, 50)
+$script:radioEnforce.Size = New-Object System.Drawing.Size(390, 20)
+$modeGroup.Controls.Add($script:radioEnforce)
+
+# Buttons
+$btnRun = New-Object System.Windows.Forms.Button
+$btnRun.Text = "Run Selected"
+$btnRun.Location = New-Object System.Drawing.Point(440, 160)
+$btnRun.Size = New-Object System.Drawing.Size(200, 40)
+$btnRun.BackColor = [System.Drawing.Color]::LightGreen
+$form.Controls.Add($btnRun)
+
+$btnExit = New-Object System.Windows.Forms.Button
+$btnExit.Text = "Exit"
+$btnExit.Location = New-Object System.Drawing.Point(660, 160)
+$btnExit.Size = New-Object System.Drawing.Size(200, 40)
+$form.Controls.Add($btnExit)
+
+# Output
+$script:OutputBox = New-Object System.Windows.Forms.TextBox
+$script:OutputBox.Location = New-Object System.Drawing.Point(20, 320)
+$script:OutputBox.Size = New-Object System.Drawing.Size(840, 320)
+$script:OutputBox.Multiline = $true
+$script:OutputBox.ScrollBars = "Vertical"
+$script:OutputBox.Font = New-Object System.Drawing.Font("Consolas", 9)
+$script:OutputBox.ReadOnly = $true
+$form.Controls.Add($script:OutputBox)
+
+# Events
+$btnRun.Add_Click({
+    $script:OutputBox.Clear()
+    
+    $mode = if ($script:radioAudit.Checked) { "Audit" } else { "Enforce" }
+    
+    Write-Log "=== Starting: $mode Mode ==="
+    
+    try {
+        if ($script:chkPassword.Checked) { Set-PasswordPolicy -Mode $mode }
+        if ($script:chkAccounts.Checked) { Set-BuiltInAccounts -Mode $mode }
+        if ($script:chkApps.Checked) { Find-UnauthorizedApps -Mode $mode }
+        if ($script:chkFirewall.Checked) { Set-Firewall -Mode $mode }
+        if ($script:chkDefender.Checked) { Set-WindowsDefender -Mode $mode }
+        
+        Export-Report
+        
+        Write-Log "=== Complete ==="
+        [System.Windows.Forms.MessageBox]::Show("Complete! Logs: $script:LogFolder", "Done")
+    } catch {
+        Write-Log "Error: $_" "ERROR"
+        [System.Windows.Forms.MessageBox]::Show("Error occurred. Check log.", "Error")
     }
-}
+})
 
-function Audit-ScheduledTasks {
-    Write-Log "Auditing Scheduled Tasks for suspicious entries..." "INFO"
-    $tasks = Get-ScheduledTask | Where-Object { $_.TaskPath -notlike "\Microsoft*" }
+$btnExit.Add_Click({ $form.Close() })
 
-    foreach ($task in $tasks) {
-        Add-Finding -Category "Scheduled Tasks" -Item $task.TaskName -Status "User Task" -Recommendation "Manually review this scheduled task."
-    }
-}
+$form.Add_Shown({
+    Write-Log "Tool started"
+    Write-Log "Log folder: $script:LogFolder"
+})
 
-function Generate-Report {
-    Write-Log "Generating security report..." "INFO"
-    $jsonReport = $Global:SecurityFindings | ConvertTo-Json -Depth 3
-    $html = "<html><head><title>Security Audit Report</title></head><body><h1>Security Audit Report</h1><table border='1'><tr><th>Category</th><th>Item</th><th>Status</th><th>Recommendation</th></tr>"
-    foreach ($finding in $Global:SecurityFindings) {
-        $html += "<tr><td>$($finding.Category)</td><td>$($finding.Item)</td><td>$($finding.Status)</td><td>$($finding.Recommendation)</td></tr>"
-    }
-    $html += "</table></body></html>"
-
-    $reportPathHtml = [System.IO.Path]::ChangeExtension($OutputReportPath, ".html")
-    $reportPathJson = [System.IO.Path]::ChangeExtension($OutputReportPath, ".json")
-
-    $html | Out-File $reportPathHtml -Encoding UTF8
-    $jsonReport | Out-File $reportPathJson -Encoding UTF8
-
-    Write-Log "Report saved to $reportPathHtml and $reportPathJson" "OK"
-}
-
-# ---------------------------- MAIN ----------------------------
-Write-Host "`n==== Windows Security Hardening Toolkit ====" -ForegroundColor Magenta
-
-Audit-UserAccountPolicies
-Audit-LocalAdministrators
-Audit-WindowsUpdates
-Audit-LoggingAndAuditing
-Audit-WindowsFirewall
-Audit-SystemIntegrity
-Audit-WindowsDefender
-Audit-ScheduledTasks
-
-Generate-Report
-
-Write-Host "`nScript completed.`n" -ForegroundColor Green
+[void]$form.ShowDialog()
