@@ -3,6 +3,14 @@
     CyberPatriot Windows Hardening Tool with GUI
 .DESCRIPTION
     Safe, auditable Windows hardening script for CyberPatriot competitions.
+    
+    Updated features include:
+    - App/User/Update Management
+    - Account Lockout Policy
+    - Audit Policy Enforcement
+    - System Hardening (SMBv1, UAC, Remote Registry)
+    - Automatic Chocolatey installation prompt
+    - **FIXED:** Chocolatey upgrade now runs in a dedicated sub-session to ensure PATH stability.
 #>
 
 [CmdletBinding()]
@@ -68,7 +76,8 @@ function Show-Confirmation {
 function Set-PasswordPolicy {
     param([string]$Mode)
     
-    Write-Log "=== Password Policy ===" "INFO"
+    # MODIFIED: Now includes Account Lockout
+    Write-Log "=== Password & Lockout Policy ===" "INFO"
     $script:ComplianceReport['PasswordPolicy'] = @{}
     
     try {
@@ -90,21 +99,26 @@ function Set-PasswordPolicy {
         if ($Mode -eq 'Audit') {
             $compliant = ([int]$currentMinLen -ge 12)
             $script:ComplianceReport['PasswordPolicy']['Status'] = if ($compliant) { "Compliant" } else { "Non-Compliant" }
+            # Add more audit checks for lockout...
         }
         elseif ($Mode -eq 'Enforce') {
-            if (Show-Confirmation "Set password policy to: Min Length 12, Complexity Enabled, Max Age 90 days?") {
+            # MODIFIED: Updated confirmation message
+            if (Show-Confirmation "Set Password & Lockout Policy? (MinLen: 12, Complexity: 1, Lockout: 5 attempts)") {
                 try {
                     $tempFile = "$env:TEMP\secpol_new.cfg"
                     $content -replace "MinimumPasswordLength\s*=\s*\d+", "MinimumPasswordLength = 12" `
-                             -replace "MaximumPasswordAge\s*=\s*\d+", "MaximumPasswordAge = 90" `
-                             -replace "MinimumPasswordAge\s*=\s*\d+", "MinimumPasswordAge = 1" `
-                             -replace "PasswordHistorySize\s*=\s*\d+", "PasswordHistorySize = 24" `
-                             -replace "PasswordComplexity\s*=\s*\d+", "PasswordComplexity = 1" | Set-Content $tempFile
+                                     -replace "MaximumPasswordAge\s*=\s*\d+", "MaximumPasswordAge = 90" `
+                                     -replace "MinimumPasswordAge\s*=\s*\d+", "MinimumPasswordAge = 1" `
+                                     -replace "PasswordHistorySize\s*=\s*\d+", "PasswordHistorySize = 24" `
+                                     -replace "PasswordComplexity\s*=\s*\d+", "PasswordComplexity = 1" `
+                                     -replace "LockoutBadCount\s*=\s*\d+", "LockoutBadCount = 5" `
+                                     -replace "LockoutDuration\s*=\s*\d+", "LockoutDuration = 15" `
+                                     -replace "ResetLockoutCount\s*=\s*\d+", "ResetLockoutCount = 15" | Set-Content $tempFile
                     
                     secedit /configure /db "$env:TEMP\secedit.sdb" /cfg $tempFile /areas SECURITYPOLICY /quiet 2>&1 | Out-Null
                     Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
                     
-                    Write-Log "Password policy configured" "INFO"
+                    Write-Log "Password and Lockout policy configured" "INFO"
                     $script:ComplianceReport['PasswordPolicy']['Status'] = "Enforced"
                 } catch {
                     Write-Log "Error: $_" "ERROR"
@@ -365,6 +379,7 @@ function Find-UnauthorizedApps {
     
     foreach ($path in $paths) {
         try {
+            # We need the UninstallString for the new dialog
             $apps = Get-ItemProperty $path -ErrorAction SilentlyContinue |
                     Where-Object { $_.DisplayName }
             $installed += $apps
@@ -391,7 +406,8 @@ function Find-UnauthorizedApps {
         # Check if in README
         $inReadme = $readmeContent -match [regex]::Escape($appName)
         
-        if ($isBad -and -not $inReadme) {
+        # Ensure the app object has an uninstall string to be actionable
+        if ($isBad -and -not $inReadme -and ($app.UninstallString -or $app.QuietUninstallString)) {
             $unauthorized += $app
             Write-Log "Unauthorized app: $appName" "WARN"
         }
@@ -409,8 +425,328 @@ function Find-UnauthorizedApps {
     $unauthorized | Select-Object DisplayName, Publisher | Out-File $listFile
     Write-Log "Unauthorized apps saved to: $listFile"
     
-    [System.Windows.Forms.MessageBox]::Show("Found $($unauthorized.Count) unauthorized apps!`nSee log for details.", "Unauthorized Apps Found", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+    # --- FIX ---
+    # Call the new app removal dialog instead of just showing a message
+    Show-UnauthorizedAppRemovalDialog -Apps $unauthorized
 }
+
+# --- NEW FUNCTION: Unauthorized App Removal Dialog ---
+function Show-UnauthorizedAppRemovalDialog {
+    param($Apps)
+    
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Unauthorized Applications Found"
+    $form.Size = New-Object System.Drawing.Size(900, 500)
+    $form.StartPosition = "CenterScreen"
+    
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Select unauthorized apps to UNINSTALL (Use caution!):"
+    $label.Location = New-Object System.Drawing.Point(10, 10)
+    $label.Size = New-Object System.Drawing.Size(870, 30)
+    $label.Font = New-Object System.Drawing.Font("Arial", 10, [System.Drawing.FontStyle]::Bold)
+    $label.ForeColor = [System.Drawing.Color]::Red
+    $form.Controls.Add($label)
+    
+    $listBox = New-Object System.Windows.Forms.CheckedListBox
+    $listBox.Location = New-Object System.Drawing.Point(10, 50)
+    $listBox.Size = New-Object System.Drawing.Size(870, 350)
+    
+    # Use Tag to store the app object
+    $listBox.Tag = @{}
+    foreach ($app in $Apps) {
+        $displayItem = "$($app.DisplayName) - Publisher: $($app.Publisher)"
+        [void]$listBox.Items.Add($displayItem)
+        $listBox.Tag.$displayItem = $app
+    }
+    
+    $form.Controls.Add($listBox)
+    
+    # Uninstall button
+    $uninstallBtn = New-Object System.Windows.Forms.Button
+    $uninstallBtn.Text = "Uninstall Selected"
+    $uninstallBtn.Location = New-Object System.Drawing.Point(10, 415)
+    $uninstallBtn.Size = New-Object System.Drawing.Size(150, 30)
+    $uninstallBtn.BackColor = [System.Drawing.Color]::Red
+    $uninstallBtn.ForeColor = [System.Drawing.Color]::White
+    $uninstallBtn.Add_Click({
+        $selectedItems = @()
+        foreach ($item in $listBox.CheckedItems) {
+            $selectedItems += $listBox.Tag.$item
+        }
+        
+        if ($selectedItems.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("No apps selected", "Info")
+            return
+        }
+        
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Are you sure you want to UNINSTALL $($selectedItems.Count) application(s)?",
+            "Confirm Uninstallation",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        
+        if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+            foreach ($app in $selectedItems) {
+                $appName = $app.DisplayName
+                $uninstallString = if ($app.QuietUninstallString) { $app.QuietUninstallString } else { $app.UninstallString }
+                
+                Write-Log "Attempting to uninstall: $appName" "WARN"
+                
+                try {
+                    $command = $uninstallString
+                    if ($uninstallString -like "*msiexec*") {
+                        $command = "$uninstallString /qn"
+                    } elseif ($uninstallString -like "*.exe*" -and $uninstallString -notlike "* /s*") {
+                        $command = "$uninstallString /S"
+                    }
+                    Start-Process cmd.exe -ArgumentList "/c $command" -Wait -NoNewWindow 2>&1 | Out-Null
+                    Write-Log "Uninstallation command executed for $appName." "INFO"
+                } catch {
+                    Write-Log "Failed to execute uninstall command for $($appName): $($_.Exception.Message)" "ERROR"
+                }
+            }
+            [System.Windows.Forms.MessageBox]::Show("Uninstallation commands sent.", "Done")
+            $form.Close()
+        }
+    })
+    $form.Controls.Add($uninstallBtn)
+    
+    # Cancel button
+    $cancelBtn = New-Object System.Windows.Forms.Button
+    $cancelBtn.Text = "Cancel"
+    $cancelBtn.Location = New-Object System.Drawing.Point(170, 415)
+    $cancelBtn.Size = New-Object System.Drawing.Size(100, 30)
+    $cancelBtn.Add_Click({ $form.Close() })
+    $form.Controls.Add($cancelBtn)
+    
+    [void]$form.ShowDialog()
+}
+# --- END NEW FUNCTION ---
+
+
+# --- APP MANAGEMENT FUNCTIONS ---
+
+function Get-InstalledApplications {
+    <#
+    .SYNOPSIS
+        Retrieves a list of installed applications.
+    #>
+    Write-Log "Retrieving installed applications..."
+    
+    # Paths for 32-bit and 64-bit applications
+    $paths = @(
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+
+    $installedApps = @()
+    foreach ($path in $paths) {
+        try {
+            # We need DisplayName and UninstallString (or QuietUninstallString)
+            $apps = Get-ItemProperty $path -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DisplayName -and ($_.UninstallString -or $_.QuietUninstallString) } |
+                    Select-Object DisplayName, UninstallString, QuietUninstallString, Publisher
+            $installedApps += $apps
+        } catch {
+            # FINAL FIX: Wrap $path in subexpression $() to isolate it from the colon, 
+            # and explicitly call .Exception.Message to guarantee string context for the error.
+            Write-Log "Error reading registry path $($path): $($_.Exception.Message)" "ERROR" 
+        }
+    }
+    
+    Write-Log "Found $($installedApps.Count) installed applications."
+    return $installedApps | Sort-Object DisplayName
+}
+
+
+function Show-AppRemovalDialog {
+    <#
+    .SYNOPSIS
+        Displays a GUI for selecting and uninstalling applications. (The "Manage All Apps" version)
+    #>
+    Write-Log "Opening Application Removal Dialog" "INFO"
+    
+    $apps = Get-InstalledApplications
+    
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Installed Applications - Remove Unnecessary Software"
+    $form.Size = New-Object System.Drawing.Size(950, 600)
+    $form.StartPosition = "CenterScreen"
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Select applications to UNINSTALL (Use caution!):"
+    $label.Location = New-Object System.Drawing.Point(10, 10)
+    $label.Size = New-Object System.Drawing.Size(910, 20)
+    $label.Font = New-Object System.Drawing.Font("Arial", 10, [System.Drawing.FontStyle]::Bold)
+    $label.ForeColor = [System.Drawing.Color]::Red
+    $form.Controls.Add($label)
+    
+    $listBox = New-Object System.Windows.Forms.CheckedListBox
+    $listBox.Location = New-Object System.Drawing.Point(10, 35)
+    $listBox.Size = New-Object System.Drawing.Size(910, 470)
+    
+    # Populate the ListBox
+    $listBox.Tag = @{} # Use Tag to map display name to the full application object
+    foreach ($app in $apps) {
+        $publisher = if ($app.Publisher) { $app.Publisher } else { "Unknown" }
+        $displayItem = "$($app.DisplayName) - Publisher: $publisher"
+        [void]$listBox.Items.Add($displayItem)
+        $listBox.Tag.$displayItem = $app
+    }
+    
+    $form.Controls.Add($listBox)
+    
+    # Uninstall button
+    $uninstallBtn = New-Object System.Windows.Forms.Button
+    $uninstallBtn.Text = "Uninstall Selected"
+    $uninstallBtn.Location = New-Object System.Drawing.Point(10, 520)
+    $uninstallBtn.Size = New-Object System.Drawing.Size(200, 30)
+    $uninstallBtn.BackColor = [System.Drawing.Color]::Red
+    $uninstallBtn.ForeColor = [System.Drawing.Color]::White
+    $uninstallBtn.Add_Click({
+        $selectedItems = @()
+        foreach ($item in $listBox.CheckedItems) {
+            $selectedItems += $listBox.Tag.$item
+        }
+        
+        if ($selectedItems.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("No apps selected for uninstallation.", "Info")
+            return
+        }
+        
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Are you sure you want to UNINSTALL $($selectedItems.Count) application(s)? This may require confirmation for each app.",
+            "Confirm Uninstallation",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        )
+        
+        if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+            foreach ($app in $selectedItems) {
+                $appName = $app.DisplayName
+                # Prioritize QuietUninstallString if it exists
+                $uninstallString = if ($app.QuietUninstallString) { $app.QuietUninstallString } else { $app.UninstallString }
+                
+                Write-Log "Attempting to uninstall: $appName" "WARN"
+                
+                try {
+                    $command = $uninstallString
+                    
+                    if ($uninstallString -like "*msiexec*") {
+                        # Add /qn for silent MSI
+                        $command = "$uninstallString /qn"
+                    } elseif ($uninstallString -like "*.exe*" -and $uninstallString -notlike "* /s*") {
+                        # Try adding /S for silent EXE
+                        $command = "$uninstallString /S"
+                    }
+                    
+                    # Use Start-Process for better handling of external executables
+                    Start-Process cmd.exe -ArgumentList "/c $command" -Wait -NoNewWindow 2>&1 | Out-Null
+                    
+                    Write-Log "Uninstallation command executed for $appName. Check later to confirm removal." "INFO"
+                } catch {
+                    # FINAL FIX: Wrap $appName in subexpression $() to isolate it from the colon,
+                    # and explicitly call .Exception.Message to guarantee string context for the error.
+                    Write-Log "Failed to execute uninstall command for $($appName): $($_.Exception.Message)" "ERROR"
+                }
+            }
+            [System.Windows.Forms.MessageBox]::Show("Uninstallation commands sent. You may need to refresh the list.", "Done")
+        }
+    })
+    $form.Controls.Add($uninstallBtn)
+
+    # Refresh Button
+    $refreshBtn = New-Object System.Windows.Forms.Button
+    $refreshBtn.Text = "Refresh List"
+    $refreshBtn.Location = New-Object System.Drawing.Point(220, 520)
+    $refreshBtn.Size = New-Object System.Drawing.Size(150, 30)
+    $refreshBtn.Add_Click({
+        $form.Close()
+        Show-AppRemovalDialog # Relaunch to refresh
+    })
+    $form.Controls.Add($refreshBtn)
+
+    # Close button
+    $cancelBtn = New-Object System.Windows.Forms.Button
+    $cancelBtn.Text = "Close"
+    $cancelBtn.Location = New-Object System.Drawing.Point(800, 520)
+    $cancelBtn.Size = New-Object System.Drawing.Size(130, 30)
+    $cancelBtn.Add_Click({ $form.Close() })
+    $form.Controls.Add($cancelBtn)
+    
+    [void]$form.ShowDialog()
+}
+
+
+function Update-AllApplications {
+    <#
+    .SYNOPSIS
+        Runs Chocolatey update only. Prompts to install Choco if not found.
+    #>
+    Write-Log "=== Updating All Chocolatey Apps ===" "INFO"
+
+    $chocoPath = "C:\ProgramData\chocolatey\choco.exe"
+    $installRequired = -not (Test-Path $chocoPath)
+    
+    # 1. INSTALL CHOCOLATEY IF NEEDED
+    if ($installRequired) {
+        Write-Log "Chocolatey not installed." "WARN"
+        if (Show-Confirmation "Chocolatey not found. Install it now to update third-party apps?") {
+            Write-Log "Attempting to install Chocolatey..."
+            try {
+                Set-ExecutionPolicy Bypass -Scope Process -Force
+                [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+                $installScript = (New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1')
+                Invoke-Expression $installScript
+                
+                Write-Log "Chocolatey installation script executed." "INFO"
+                Start-Sleep -Seconds 3 # Wait a moment for file system changes
+                
+            } catch {
+                Write-Log "Failed to install Chocolatey: $($_.Exception.Message)" "ERROR"
+            }
+        }
+    }
+    
+    # 2. RUN UPDATE IN A NEW SHELL FOR STABLE ENVIRONMENT
+    if (Test-Path $chocoPath) {
+        Write-Log "Chocolatey found. Attempting to update all Chocolatey-managed apps in a new shell."
+        if (Show-Confirmation "Run 'choco upgrade all' to update all third-party software?") {
+            try {
+                # This script block will run in a fresh PowerShell instance, ensuring the PATH is loaded.
+                $upgradeScriptBlock = {
+                    param($LogFile)
+                    # Force environment reload one last time just in case
+                    $env:PATH = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+                    
+                    # Execute the upgrade command and pipe output to the log file
+                    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [INFO] Choco: Starting upgrade..." | Out-File $LogFile -Append
+                    
+                    # Run choco.exe using the path to ensure it's found
+                    & "C:\ProgramData\chocolatey\choco.exe" upgrade all -y -r 2>&1 | Out-File $LogFile -Append
+                    
+                    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [INFO] Choco: Upgrade command finished." | Out-File $LogFile -Append
+                }
+                
+                # Start the new process and wait for it to complete
+                $process = Start-Process powershell.exe -ArgumentList "-ExecutionPolicy Bypass", "-NoProfile", "-WindowStyle Hidden", "-Command", " & $upgradeScriptBlock -LogFile '$script:LogFile' " -Wait -PassThru
+                
+                Write-Log "Chocolatey upgrade process started (PID: $($process.Id)) and finished." "INFO"
+                
+            } catch {
+                Write-Log "Error running choco upgrade: $($_.Exception.Message)" "ERROR"
+            }
+        }
+    } else {
+        Write-Log "Chocolatey not installed. Skipping third-party app update."
+    }
+}
+
+# --- END APP MANAGEMENT FUNCTIONS ---
+
 
 function Set-Firewall {
     param([string]$Mode)
@@ -448,6 +784,115 @@ function Set-WindowsDefender {
     }
 }
 
+# --- NEW HARDENING FUNCTIONS ---
+
+function Set-AuditPolicy {
+    param([string]$Mode)
+    
+    Write-Log "=== Audit Policy ===" "INFO"
+    $script:ComplianceReport['AuditPolicy'] = @{}
+    
+    # In Audit mode, we'll just check one setting
+    if ($Mode -eq 'Audit') {
+        try {
+            $logon = auditpol /get /subcategory:"Logon" /r | ConvertFrom-Csv
+            if ($logon.'Inclusion Setting' -notlike "*Success and Failure*") {
+                 Write-Log "Audit policy for Logon is not set to Success and Failure." "WARN"
+                 $script:ComplianceReport['AuditPolicy']['Status'] = "Non-Compliant"
+            } else {
+                 Write-Log "Audit policy for Logon is compliant." "INFO"
+                 $script:ComplianceReport['AuditPolicy']['Status'] = "Compliant"
+            }
+        } catch {
+             Write-Log "Could not audit policy (auditpol.exe failed)." "ERROR"
+        }
+    }
+    elseif ($Mode -eq 'Enforce') {
+        if (Show-Confirmation "Enable advanced audit policies? (Logon, Account Logon, Policy Change)") {
+            try {
+                Write-Log "Enforcing audit policies..."
+                auditpol /set /subcategory:"Logon" /success:enable /failure:enable 2>&1 | Out-Null
+                auditpol /set /subcategory:"Account Logon" /success:enable /failure:enable 2>&1 | Out-Null
+                auditpol /set /subcategory:"Other Logon/Logoff Events" /success:enable /failure:enable 2>&1 | Out-Null
+                auditpol /set /subcategory:"Policy Change" /success:enable /failure:enable 2>&1 | Out-Null
+                Write-Log "Advanced audit policies enforced." "INFO"
+                $script:ComplianceReport['AuditPolicy']['Status'] = "Enforced"
+            } catch {
+                 Write-Log "Failed to enforce audit policies: $($_.Exception.Message)" "ERROR"
+            }
+        }
+    }
+}
+
+function Set-SystemHardening {
+    param([string]$Mode)
+    Write-Log "=== System Hardening ===" "INFO"
+    $script:ComplianceReport['SystemHardening'] = @{}
+    
+    # 1. Disable SMBv1
+    try {
+        $smb = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue
+        if ($smb -and $smb.State -eq 'Enabled') {
+            Write-Log "SMBv1 is enabled." "WARN"
+            if ($Mode -eq 'Enforce') {
+                if (Show-Confirmation "Disable SMBv1 Protocol? (Highly Recommended, requires reboot)") {
+                    Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction Stop
+                    Write-Log "SMBv1 has been disabled. A reboot is required." "WARN"
+                    $script:ComplianceReport['SystemHardening']['SMBv1'] = "Enforced"
+                }
+            }
+        } else {
+             Write-Log "SMBv1 is already disabled or not present." "INFO"
+             $script:ComplianceReport['SystemHardening']['SMBv1'] = "Compliant"
+        }
+    } catch {
+        Write-Log "Error checking/disabling SMBv1: $($_.Exception.Message)" "ERROR"
+    }
+
+    # 2. Disable Remote Registry
+    try {
+        $svc = Get-Service -Name "RemoteRegistry" -ErrorAction SilentlyContinue
+        if ($svc -and $svc.StartType -ne 'Disabled') {
+            Write-Log "Remote Registry service is not disabled." "WARN"
+            if ($Mode -eq 'Enforce') {
+                if (Show-Confirmation "Disable and Stop Remote Registry service?") {
+                    Set-Service -Name "RemoteRegistry" -StartupType Disabled -Status Stopped
+                    Write-Log "Remote Registry service disabled and stopped." "INFO"
+                    $script:ComplianceReport['SystemHardening']['RemoteRegistry'] = "Enforced"
+                }
+            }
+        } else {
+            Write-Log "Remote Registry service is already disabled." "INFO"
+            $script:ComplianceReport['SystemHardening']['RemoteRegistry'] = "Compliant"
+        }
+    } catch {
+         Write-Log "Error checking/disabling Remote Registry: $($_.Exception.Message)" "ERROR"
+    }
+
+    # 3. Enable UAC
+    try {
+        $lua = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLUA" -ErrorAction SilentlyContinue
+        if ($lua -and $lua.EnableLUA -ne 1) {
+            Write-Log "UAC (EnableLUA) is disabled." "WARN"
+            if ($Mode -eq 'Enforce') {
+                if (Show-Confirmation "Enable UAC (User Account Control)?") {
+                    Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLUA" -Value 1 -ErrorAction Stop
+                    Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "ConsentPromptBehaviorAdmin" -Value 5 -ErrorAction Stop
+                    Write-Log "UAC has been enabled." "INFO"
+                    $script:ComplianceReport['SystemHardening']['UAC'] = "Enforced"
+                }
+            }
+        } else {
+             Write-Log "UAC is already enabled." "INFO"
+             $script:ComplianceReport['SystemHardening']['UAC'] = "Compliant"
+        }
+    } catch {
+         Write-Log "Error checking/enabling UAC: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# --- END NEW HARDENING FUNCTIONS ---
+
 function Export-Report {
     Write-Log "=== Generating Report ===" "INFO"
     $script:ComplianceReport | ConvertTo-Json -Depth 10 | Out-File $script:JsonReport
@@ -475,7 +920,8 @@ $optionsGroup.Size = New-Object System.Drawing.Size(400, 250)
 $form.Controls.Add($optionsGroup)
 
 $script:chkPassword = New-Object System.Windows.Forms.CheckBox
-$script:chkPassword.Text = "Password Policy"
+# MODIFIED: Checkbox text
+$script:chkPassword.Text = "Password & Lockout Policy"
 $script:chkPassword.Location = New-Object System.Drawing.Point(15, 25)
 $script:chkPassword.Size = New-Object System.Drawing.Size(350, 20)
 $script:chkPassword.Checked = $true
@@ -509,6 +955,31 @@ $script:chkDefender.Size = New-Object System.Drawing.Size(350, 20)
 $script:chkDefender.Checked = $true
 $optionsGroup.Controls.Add($script:chkDefender)
 
+# CHECKBOX FOR UPDATES (CLARIFIED TEXT)
+$script:chkUpdates = New-Object System.Windows.Forms.CheckBox
+$script:chkUpdates.Text = "Update All Apps (via Chocolatey)"
+$script:chkUpdates.Location = New-Object System.Drawing.Point(15, 150)
+$script:chkUpdates.Size = New-Object System.Drawing.Size(350, 20)
+$script:chkUpdates.Checked = $false # Start unchecked as updates take a long time
+$optionsGroup.Controls.Add($script:chkUpdates)
+# END CHECKBOX
+
+# --- NEW GUI CHECKBOXES ---
+$script:chkAuditPolicy = New-Object System.Windows.Forms.CheckBox
+$script:chkAuditPolicy.Text = "Enable Audit Policy (Logon, Policy Change)"
+$script:chkAuditPolicy.Location = New-Object System.Drawing.Point(15, 175)
+$script:chkAuditPolicy.Size = New-Object System.Drawing.Size(350, 20)
+$script:chkAuditPolicy.Checked = $true
+$optionsGroup.Controls.Add($script:chkAuditPolicy)
+
+$script:chkSystemHardening = New-Object System.Windows.Forms.CheckBox
+$script:chkSystemHardening.Text = "System Hardening (SMBv1, UAC, Remote Registry)"
+$script:chkSystemHardening.Location = New-Object System.Drawing.Point(15, 200)
+$script:chkSystemHardening.Size = New-Object System.Drawing.Size(350, 20)
+$script:chkSystemHardening.Checked = $true
+$optionsGroup.Controls.Add($script:chkSystemHardening)
+# --- END NEW GUI CHECKBOXES ---
+
 # Mode
 $modeGroup = New-Object System.Windows.Forms.GroupBox
 $modeGroup.Text = "Mode"
@@ -536,6 +1007,15 @@ $btnRun.Location = New-Object System.Drawing.Point(440, 160)
 $btnRun.Size = New-Object System.Drawing.Size(200, 40)
 $btnRun.BackColor = [System.Drawing.Color]::LightGreen
 $form.Controls.Add($btnRun)
+
+# NEW UNINSTALL BUTTON
+$btnUninstall = New-Object System.Windows.Forms.Button
+$btnUninstall.Text = "Manage/Uninstall Apps"
+$btnUninstall.Location = New-Object System.Drawing.Point(440, 210)
+$btnUninstall.Size = New-Object System.Drawing.Size(200, 40)
+$btnUninstall.BackColor = [System.Drawing.Color]::LightBlue
+$form.Controls.Add($btnUninstall)
+# END NEW UNINSTALL BUTTON
 
 $btnExit = New-Object System.Windows.Forms.Button
 $btnExit.Text = "Exit"
@@ -568,6 +1048,14 @@ $btnRun.Add_Click({
         if ($script:chkFirewall.Checked) { Set-Firewall -Mode $mode }
         if ($script:chkDefender.Checked) { Set-WindowsDefender -Mode $mode }
         
+        # --- NEW RUN EVENTS ---
+        if ($script:chkAuditPolicy.Checked) { Set-AuditPolicy -Mode $mode }
+        if ($script:chkSystemHardening.Checked) { Set-SystemHardening -Mode $mode }
+        # --- END NEW RUN EVENTS ---
+        
+        # INTEGRATED APP UPDATE CHECK
+        if ($script:chkUpdates.Checked) { Update-AllApplications } 
+        
         Export-Report
         
         Write-Log "=== Complete ==="
@@ -579,6 +1067,12 @@ $btnRun.Add_Click({
 })
 
 $btnExit.Add_Click({ $form.Close() })
+
+# NEW EVENT FOR UNINSTALL BUTTON
+$btnUninstall.Add_Click({
+    Show-AppRemovalDialog
+})
+# END NEW EVENT
 
 $form.Add_Shown({
     Write-Log "Tool started"
